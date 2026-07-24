@@ -27,7 +27,7 @@ function App() {
     setLoading(true);
 
     try {
-      const res = await fetch('http://localhost:3001/api/ask', {
+      const res = await fetch('https://repo-chat-ckig.onrender.com/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: text }),
