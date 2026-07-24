@@ -116,7 +116,7 @@ QUESTION: ${question}
 
 ANSWER:`;
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-flash-lite-latest' });
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
