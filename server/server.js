@@ -22,7 +22,7 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 // (The free NVIDIA embed model was returning an unexpected response shape.)
 const EMBEDDING_MODEL = 'openai/text-embedding-3-small';
 // Chat/answering: keep the free NVIDIA reasoning model.
-const CHAT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+const CHAT_MODEL = 'openai/gpt-4o-mini';
 
 // In-memory store: { repoId: [ { file, text, embedding }, ... ] }
 const repoStore = {};
