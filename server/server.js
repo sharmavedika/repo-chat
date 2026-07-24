@@ -18,13 +18,16 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 // Swap these strings any time without touching the rest of the code.
 // Both set to free models below — swap EMBEDDING_MODEL back to a paid one
 // (e.g. 'openai/text-embedding-3-small') if you want higher quality retrieval.
-const EMBEDDING_MODEL = 'nvidia/nemotron-3-embed-1b:free';
+// Embeddings: use a model with reliable OpenAI-style batch support.
+// (The free NVIDIA embed model was returning an unexpected response shape.)
+const EMBEDDING_MODEL = 'openai/text-embedding-3-small';
+// Chat/answering: keep the free NVIDIA reasoning model.
 const CHAT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
 
 // In-memory store: { repoId: [ { file, text, embedding }, ... ] }
 const repoStore = {};
 
-const CODE_EXTENSIONS = 'js,jsx,ts,tsx,py,java,go,rb,php,ejs,html,css,md,ipynb';
+const CODE_EXTENSIONS = 'js,jsx,ts,tsx,py,java,go,rb,php,ejs,html,css,md';
 const MAX_CHUNKS = 150; // safety cap so huge repos don't take forever
 const EMBED_BATCH_SIZE = 20; // chunks per embeddings request
 
@@ -102,6 +105,15 @@ async function embedBatch(texts) {
     model: EMBEDDING_MODEL,
     input: texts,
   });
+
+  if (!data || !Array.isArray(data.data)) {
+    console.error('Unexpected embeddings response:', JSON.stringify(data));
+    throw new Error(
+      `Embedding model "${EMBEDDING_MODEL}" returned an unexpected response shape. ` +
+      `It may not support batched input, or the model ID may be wrong.`
+    );
+  }
+
   // OpenAI-shaped response: data.data is an array in the same order as input
   return data.data.map((d) => d.embedding);
 }
