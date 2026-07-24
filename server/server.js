@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { glob } = require('glob');
 const simpleGit = require('simple-git');
 const fs = require('fs');
@@ -12,13 +11,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+
+// Pick any embedding + chat model OpenRouter supports.
+// Swap these strings any time without touching the rest of the code.
+// Both set to free models below — swap EMBEDDING_MODEL back to a paid one
+// (e.g. 'openai/text-embedding-3-small') if you want higher quality retrieval.
+const EMBEDDING_MODEL = 'nvidia/nemotron-3-embed-1b:free';
+const CHAT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
 
 // In-memory store: { repoId: [ { file, text, embedding }, ... ] }
 const repoStore = {};
 
 const CODE_EXTENSIONS = 'js,jsx,ts,tsx,py,java,go,rb,php,ejs,html,css,md';
-const MAX_CHUNKS = 150; // safety cap so huge repos don't take forever on free tier
+const MAX_CHUNKS = 150; // safety cap so huge repos don't take forever
+const EMBED_BATCH_SIZE = 20; // chunks per embeddings request
 
 function cosineSimilarity(a, b) {
   let dot = 0, normA = 0, normB = 0;
@@ -39,10 +47,68 @@ function chunkFile(content, chunkSize = 40) {
   return chunks;
 }
 
+// Generic fetch-with-retry for OpenRouter. Retries on 429s and 5xxs
+// with exponential backoff, and throws a clean Error otherwise.
+async function openRouterFetch(endpoint, body, { retries = 4 } = {}) {
+  let attempt = 0;
+  let lastErr;
+
+  while (attempt < retries) {
+    attempt++;
+    try {
+      const res = await fetch(`${OPENROUTER_BASE_URL}${endpoint}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          // Optional but recommended by OpenRouter for attribution/rankings
+          'HTTP-Referer': process.env.PUBLIC_APP_URL || 'https://repo-chat.example',
+          'X-Title': 'repo-chat',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (res.status === 429 || res.status >= 500) {
+        const text = await res.text();
+        lastErr = new Error(`OpenRouter ${res.status}: ${text}`);
+        if (attempt < retries) {
+          const waitMs = 500 * Math.pow(2, attempt - 1); // 500ms, 1s, 2s, 4s...
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        throw lastErr;
+      }
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`OpenRouter ${res.status}: ${text}`);
+      }
+
+      return res.json();
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= retries) throw err;
+      const waitMs = 500 * Math.pow(2, attempt - 1);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+
+  throw lastErr;
+}
+
+// Embed a batch of strings in a single request.
+async function embedBatch(texts) {
+  const data = await openRouterFetch('/embeddings', {
+    model: EMBEDDING_MODEL,
+    input: texts,
+  });
+  // OpenAI-shaped response: data.data is an array in the same order as input
+  return data.data.map((d) => d.embedding);
+}
+
 async function embedText(text) {
-  const model = genAI.getGenerativeModel({ model: 'gemini-embedding-001' });
-  const result = await model.embedContent(text);
-  return result.embedding.values;
+  const [embedding] = await embedBatch([text]);
+  return embedding;
 }
 
 // Turn a GitHub URL into a stable, safe folder-name-friendly ID
@@ -63,7 +129,8 @@ async function ingestRepo(repoUrl) {
     ignore: '**/node_modules/**',
   });
 
-  const chunks = [];
+  // 3. Collect all chunks (with their source file) up to the safety cap
+  const pending = [];
   outer:
   for (const file of files) {
     const content = fs.readFileSync(file, 'utf-8');
@@ -71,18 +138,24 @@ async function ingestRepo(repoUrl) {
 
     for (const chunk of fileChunks) {
       if (chunk.trim().length === 0) continue;
-      if (chunks.length >= MAX_CHUNKS) break outer; // safety cap
+      if (pending.length >= MAX_CHUNKS) break outer;
 
-      const embedding = await embedText(chunk);
-      chunks.push({
-        file: path.relative(tmpDir, file),
-        text: chunk,
-        embedding,
-      });
+      pending.push({ file: path.relative(tmpDir, file), text: chunk });
     }
   }
 
-  // 3. Store in memory, clean up disk
+  // 4. Embed in batches instead of one call per chunk.
+  //    This is the main fix for the 429 rate-limit crashes.
+  const chunks = [];
+  for (let i = 0; i < pending.length; i += EMBED_BATCH_SIZE) {
+    const batch = pending.slice(i, i + EMBED_BATCH_SIZE);
+    const embeddings = await embedBatch(batch.map((b) => b.text));
+    batch.forEach((b, idx) => {
+      chunks.push({ ...b, embedding: embeddings[idx] });
+    });
+  }
+
+  // 5. Store in memory, clean up disk
   repoStore[repoId] = chunks;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 
@@ -94,7 +167,7 @@ async function search(repoId, question, topK = 3) {
   if (!chunks) throw new Error('Repo not found. Please ingest it first.');
 
   const questionEmbedding = await embedText(question);
-  const scored = chunks.map(chunk => ({
+  const scored = chunks.map((chunk) => ({
     ...chunk,
     score: cosineSimilarity(questionEmbedding, chunk.embedding),
   }));
@@ -102,9 +175,9 @@ async function search(repoId, question, topK = 3) {
   return scored.slice(0, topK);
 }
 
-async function askQuestion(repoId, question, retries = 3) {
+async function askQuestion(repoId, question) {
   const results = await search(repoId, question);
-  const context = results.map(r => `File: ${r.file}\n${r.text}`).join('\n\n---\n\n');
+  const context = results.map((r) => `File: ${r.file}\n${r.text}`).join('\n\n---\n\n');
 
   const prompt = `You are a helpful assistant answering questions about a codebase.
 Use ONLY the code context below to answer. If the answer isn't in the context, say so clearly.
@@ -116,17 +189,13 @@ QUESTION: ${question}
 
 ANSWER:`;
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-flash-lite-latest' });
+  const data = await openRouterFetch('/chat/completions', {
+    model: CHAT_MODEL,
+    messages: [{ role: 'user', content: prompt }],
+  });
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const result = await model.generateContent(prompt);
-      return { answer: result.response.text(), sources: results.map(r => r.file) };
-    } catch (err) {
-      if (attempt === retries) throw err;
-      await new Promise(res => setTimeout(res, 2000));
-    }
-  }
+  const answer = data.choices?.[0]?.message?.content ?? '(no answer returned)';
+  return { answer, sources: results.map((r) => r.file) };
 }
 
 // Ingest a new repo
@@ -139,7 +208,12 @@ app.post('/api/ingest', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message || 'Failed to ingest repo' });
+    const isRateLimit = /429|rate limit/i.test(err.message || '');
+    res.status(isRateLimit ? 429 : 500).json({
+      error: isRateLimit
+        ? 'Hit a rate limit while embedding this repo. Please try again in a moment.'
+        : (err.message || 'Failed to ingest repo'),
+    });
   }
 });
 
@@ -153,7 +227,12 @@ app.post('/api/ask', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message || 'Something went wrong' });
+    const isRateLimit = /429|rate limit/i.test(err.message || '');
+    res.status(isRateLimit ? 429 : 500).json({
+      error: isRateLimit
+        ? 'Hit a rate limit answering that question. Please try again in a moment.'
+        : (err.message || 'Something went wrong'),
+    });
   }
 });
 
