@@ -24,7 +24,7 @@ const CHAT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
 // In-memory store: { repoId: [ { file, text, embedding }, ... ] }
 const repoStore = {};
 
-const CODE_EXTENSIONS = 'js,jsx,ts,tsx,py,java,go,rb,php,ejs,html,css,md';
+const CODE_EXTENSIONS = 'js,jsx,ts,tsx,py,java,go,rb,php,ejs,html,css,md,ipynb';
 const MAX_CHUNKS = 150; // safety cap so huge repos don't take forever
 const EMBED_BATCH_SIZE = 20; // chunks per embeddings request
 
